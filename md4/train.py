@@ -639,3 +639,220 @@ def train_and_evaluate(
           )
 
   logging.info("Finishing training at step %d", num_train_steps)
+
+
+
+
+
+def evaluate_checkpoint(
+    config: ml_collections.ConfigDict, workdir: epath.PathLike
+):
+  """Runs an evaluation from a checkpoint.
+
+  Args:
+    config: Configuration to use.
+    workdir: Working directory for checkpoints and TF summaries. If this
+      contains checkpoint training will be resumed from the latest checkpoint.
+  """
+  workdir = epath.Path(workdir)
+  workdir.mkdir(parents=True, exist_ok=True)
+
+  rng = utils.get_rng(config.seed)
+  logging.info("Using random seed %s.", rng)
+  writer = metric_writers.create_default_writer(
+      workdir, just_logging=jax.process_index() > 0
+  )
+  # Learning rate schedule.
+  assert config.batch_size % jax.device_count() == 0
+  per_device_batch_size = config.batch_size // jax.device_count()
+  num_train_steps = input_pipeline.get_num_train_steps(config)
+  steps_per_epoch = num_train_steps // config.num_epochs
+  logging.info(
+      "num_train_steps=%d, steps_per_epoch=%d", num_train_steps, steps_per_epoch
+  )
+  schedule_fn = functools.partial(
+      get_learning_rate,
+      base_learning_rate=config.learning_rate,
+      num_steps=num_train_steps,
+      warmup_steps=config.warmup_steps,
+      schedule_type=config.learning_rate_schedule,
+  )
+
+  # Build input pipeline.
+  rng, data_seed = jax.random.split(rng)
+  data_seed = int(
+      jax.random.randint(data_seed, [], minval=0, maxval=np.iinfo(np.int32).max)
+  )
+  # The input pipeline runs on each process and loads data for local TPUs.
+  create_datasets = (
+      input_pipeline_v2.create_datasets
+      if config.get("use_v2_input_pipeline", None)
+      else input_pipeline.create_datasets
+  )
+  train_loader, eval_loaders, dataset_info = create_datasets(config, data_seed)
+  train_iter = iter(train_loader)
+
+  # Initialize model.
+  rng, model_rng = jax.random.split(rng)
+  data_shape = input_pipeline.get_data_shape(config)
+  model, optimizer, train_state, metrics_class = create_train_state(  # pylint: disable=invalid-name
+      config,
+      model_rng,
+      input_shape=(per_device_batch_size,) + data_shape,
+      schedule_fn=schedule_fn,
+  )
+
+  # Set up checkpointing of the model and the input pipeline.
+  checkpoint_manager = _get_checkpoint_manager(config, workdir)
+
+  # Retrieve data from previous checkpoints if possible.
+  checkpointed_state = dict(train_state=train_state, train_iter=train_iter)
+  if checkpoint_manager.latest_step() is not None:
+    checkpointed_state = checkpoint_manager.restore(
+        checkpoint_manager.latest_step(), items=checkpointed_state
+    )
+  train_state = checkpointed_state["train_state"]
+  train_iter = checkpointed_state["train_iter"]
+
+  # Distribute training.
+  train_state = flax_utils.replicate(train_state)
+  train_step_func = functools.partial(
+      train_step,
+      model=model,
+      optimizer=optimizer,
+      train_metrics_class=metrics_class,
+      learning_rate_fn=schedule_fn,
+      ema_rate=config.ema_rate,
+      num_microbatches=config.get("num_microbatches", None),
+  )
+  if config.check_nans:
+    train_step_func = checkify.checkify(
+        train_step_func, errors=checkify.float_checks
+    )
+  p_train_step = jax.pmap(
+      train_step_func, axis_name="batch", donate_argnums=(0,)
+  )
+  p_eval_step = jax.pmap(
+      functools.partial(
+          eval_step,
+          model=model,
+          eval_metrics_class=metrics_class,
+          ema_rate=config.ema_rate,
+      ),
+      axis_name="batch",
+  )
+
+  hooks = []
+  report_progress = periodic_actions.ReportProgress(
+      num_train_steps=num_train_steps, writer=writer
+  )
+  if jax.process_index() == 0:
+    hooks += [
+        report_progress,
+        periodic_actions.Profile(num_profile_steps=5, logdir=workdir),
+    ]
+  train_metrics = None
+
+  # Unreplicating from TPU is costly, so we only do it once at the start.
+  initial_step = int(flax.jax_utils.unreplicate(train_state.step))
+
+  with metric_writers.ensure_flushes(writer):
+    logging.log_first_n(logging.INFO, "Training state at step %d.", 5, initial_step)
+    # Steps are in interval [1, num_train_steps], not [0, num_train_steps - 1].
+    # for step in range(initial_step + 1, num_train_steps + 1):
+    #   is_last_step = step == num_train_steps
+
+    #   with jax.profiler.StepTraceAnnotation("train", step_num=step):
+    #     batch = utils.reshape_batch(next(train_iter))
+    #     if config.check_nans:
+    #       errs, (train_state, metrics_update) = p_train_step(
+    #           train_state=train_state, batch=batch
+    #       )
+    #       errs.throw()
+    #     else:
+    #       train_state, metrics_update = p_train_step(
+    #           train_state=train_state, batch=batch
+    #       )
+    #     metric_update = flax_utils.unreplicate(metrics_update)
+    #     train_metrics = (
+    #         metric_update
+    #         if train_metrics is None
+    #         else train_metrics.merge(metric_update)
+    #     )
+
+    #   # Quick indication that training is happening.
+    #   logging.log_first_n(logging.INFO, "Finished training step %d.", 5, step)
+    #   for h in hooks:
+    #     h(step)
+
+    #   if step % config.log_loss_every_steps == 0 or is_last_step:
+    #     writer.write_scalars(step, train_metrics.compute())
+    #     train_metrics = None
+
+    #   if step == 1 or step % config.eval_every_steps == 0 or is_last_step:
+    #     for split, eval_loader in eval_loaders.items():
+    #       rng, eval_rng = jax.random.split(rng)
+    #       with report_progress.timed("eval"):
+    #         train_state = merge_batch_stats(train_state)
+    #         eval_metrics = evaluate(
+    #             p_eval_step,
+    #             eval_rng,
+    #             train_state,
+    #             eval_loader,
+    #             config.num_eval_steps,
+    #         )
+    #       eval_metrics_cpu = jax.tree_util.tree_map(
+    #           np.array, eval_metrics.compute()
+    #       )
+    #       eval_metrics_cpu = {
+    #           split + "_" + k: v for k, v in eval_metrics_cpu.items()
+    #       }
+    #       writer.write_scalars(step, eval_metrics_cpu)
+
+    #     if hasattr(model, "sample_step"):
+    #       with report_progress.timed("sample"):
+    #         _, sample_rng = jax.random.split(rng)
+    #         dummy_loader = train_loader
+    #         dummy_batch = utils.reshape_batch(next(iter(dummy_loader)))
+    #         dummy_inputs = dummy_batch[config.task_type]
+    #         if "label" in dummy_batch:
+    #           conditioning = dummy_batch["label"].astype("int32")
+    #         else:
+    #           conditioning = None
+
+    #         samples = sampling.generate(
+    #             model,
+    #             train_state,
+    #             flax_utils.replicate(sample_rng),
+    #             dummy_inputs,
+    #             conditioning=conditioning,
+    #         )
+
+    #         all_samples = jax.pmap(
+    #             lambda x: jax.lax.all_gather(x, "batch"), axis_name="batch"
+    #         )(samples)
+    #         all_samples = flax_utils.unreplicate(all_samples)
+    #         all_samples = all_samples.reshape(-1, *data_shape)
+    #         if config.task_type == "image":
+    #           sample_grid = utils.generate_image_grids(all_samples)
+    #           writer.write_images(step, {"samples": sample_grid})
+    #           del all_samples, sample_grid
+    #         elif config.task_type == "text":
+    #           tokenizer = dataset_info["tokenizer"]
+    #           texts = utils.detokenize_texts(all_samples, tokenizer)
+    #           writer.write_texts(step, {"samples": texts})
+
+    #   if step % config.checkpoint_every_steps == 0 or is_last_step:
+    #     with report_progress.timed("checkpoint"):
+    #       train_state = merge_batch_stats(train_state)
+    #       checkpoint_manager.save(
+    #           step,
+    #           items=dict(
+    #               train_state=jax.tree_util.tree_map(
+    #                   np.array, flax_utils.unreplicate(train_state)
+    #               ),
+    #               train_iter=train_iter,
+    #           ),
+    #       )
+
+  logging.info("Finishing training at step %d", num_train_steps)

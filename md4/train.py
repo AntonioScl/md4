@@ -489,6 +489,10 @@ def train_and_evaluate(
   # Set up checkpointing of the model and the input pipeline.
   checkpoint_manager = _get_checkpoint_manager(config, workdir)
 
+  # Chepoints lists
+  eval_log_steps = [config.eval_every_log_steps**i for i in range(0, int(np.log(num_train_steps) / np.log(config.eval_every_log_steps)) + 1)]
+  checkpoint_log_steps = [config.checkpoint_every_log_steps**i for i in range(0, int(np.log(num_train_steps) / np.log(config.checkpoint_every_log_steps)) + 1)]
+
   # Retrieve data from previous checkpoints if possible.
   checkpointed_state = dict(train_state=train_state, train_iter=train_iter)
   if checkpoint_manager.latest_step() is not None:
@@ -572,7 +576,8 @@ def train_and_evaluate(
         writer.write_scalars(step, train_metrics.compute())
         train_metrics = None
 
-      if step == 1 or step % config.eval_every_steps == 0 or is_last_step:
+      # if step == 1 or step % config.eval_every_steps == 0 or is_last_step:
+      if step == 1 or step in eval_log_steps or is_last_step:
         for split, eval_loader in eval_loaders.items():
           rng, eval_rng = jax.random.split(rng)
           with report_progress.timed("eval"):
@@ -625,7 +630,8 @@ def train_and_evaluate(
               texts = utils.detokenize_texts(all_samples, tokenizer)
               writer.write_texts(step, {"samples": texts})
 
-      if step % config.checkpoint_every_steps == 0 or is_last_step:
+      # if step % config.checkpoint_every_steps == 0 or is_last_step:
+      if step in checkpoint_log_steps or is_last_step:
         with report_progress.timed("checkpoint"):
           train_state = merge_batch_stats(train_state)
           checkpoint_manager.save(

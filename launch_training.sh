@@ -9,9 +9,9 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=94g
-#SBATCH --time=0:30:00
+#SBATCH --time=5:00:00
 
 module load gcc/13.2.0 tmux/2.9a python/3.11.7 cuda/12.4.1 cudnn/9.2.1.18-12 openmpi/5.0.3-cuda py-mpi4py/4.0.0
 source /home/sclocchi/venvs_kuma/md4_venv/bin/activate
 
-python md4/main.py --config=md4/configs/md4/custom_openwebtext.py --sharded=false --workdir=./expt
+python md4/main.py --config=md4/configs/md4/custom_openwebtext.py --sharded=false --workdir=/scratch/sclocchi/md4/expt2

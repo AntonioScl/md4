@@ -28,3 +28,4 @@ data_dir/openwebtext_splits_1024_eval
 data_dir/openwebtext_splits_1024_train
 slurm_out/*
 events*
+expt*

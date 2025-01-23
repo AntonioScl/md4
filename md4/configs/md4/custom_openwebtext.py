@@ -87,7 +87,11 @@ def get_config() -> config_dict.ConfigDict:
   config.log_loss_every_steps = 500
   config.eval_every_steps = 10000
   config.checkpoint_every_steps = 5000
-  config.checkpoint_keep_period = 200000
+  config.checkpoint_keep_period = 2000000
+
+  # Added for log checkpoints
+  config.eval_every_log_steps = 2
+  config.checkpoint_every_log_steps = 4
 
   # Single integer or tuple. If None will use (XManager ID, work unit).
   config.seed = 42

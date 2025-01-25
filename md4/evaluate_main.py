@@ -29,7 +29,7 @@ from ml_collections import config_flags
 import tensorflow.compat.v2 as tf
 
 from md4 import sharded_train
-from md4 import train
+from md4 import evaluate_checkpoint
 
 
 FLAGS = flags.FLAGS
@@ -38,7 +38,9 @@ config_flags.DEFINE_config_file(
     "config", None, "Training configuration.", lock_config=True)
 flags.DEFINE_string("workdir", None, "Work unit directory.")
 flags.DEFINE_boolean("sharded", False, "Whether to use sharded training.")
-flags.mark_flags_as_required(["config", "workdir"])
+flags.DEFINE_integer('checkpoint_step', None, 'Checkpoint step to evaluate')
+flags.DEFINE_integer('num_batches', None, 'Number of batches of data to generate')
+flags.mark_flags_as_required(["config", "workdir", "checkpoint_step", "num_batches"])
 # Flags --jax_backend_target and --jax_xla_backend are available through JAX.
 
 
@@ -69,7 +71,8 @@ def main(argv):
 #   else:
 #     train.train_and_evaluate(FLAGS.config, FLAGS.workdir)
 
-  train.evaluate_checkpoint(FLAGS.config, FLAGS.workdir)
+  # train.evaluate_checkpoint(FLAGS.config, FLAGS.workdir)
+  evaluate_checkpoint.evaluate_checkpoint(FLAGS.config, FLAGS.workdir, FLAGS.checkpoint_step, FLAGS.num_batches)
 
 
 if __name__ == "__main__":

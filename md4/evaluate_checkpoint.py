@@ -37,6 +37,8 @@ import ml_collections
 import numpy as np
 import optax
 from orbax import checkpoint as orbax_checkpoint
+import pickle
+import json
 
 from md4 import input_pipeline
 from md4 import input_pipeline_v2
@@ -242,6 +244,56 @@ def loss_fn(params, state, rng, model, batch, train=False):
   return loss, metrics_dict
 
 
+def loss_ngrams(params, state, rng, model, batch, train=False):
+  """Loss function."""
+  rng, sample_rng = jax.random.split(rng)
+  rngs = {"sample": sample_rng}
+  if train:
+    _, dropout_rng = jax.random.split(rng)
+    rngs["dropout"] = dropout_rng
+
+  variables = {"params": params, **state}
+
+  if "text" in batch:
+    x = batch["text"]
+#   elif "image" in batch:
+#     x = batch["image"]
+  else:
+    raise ValueError("Unsupported targets/tasks.")
+
+  if "label" in batch:
+    conditioning = batch["label"].astype("int32")
+  else:
+    conditioning = None
+
+#   new_state = {}
+#   if train:
+#     metrics_dict, new_state = model.apply(
+#         variables,
+#         x,
+#         cond=conditioning,
+#         train=train,
+#         rngs=rngs,
+#         mutable=list(state.keys()),
+#     )
+#   else:
+#     metrics_dict = model.apply(
+#         variables, x, cond=conditioning, train=train, rngs=rngs
+#     )
+
+#   ngram_losses = model.compute_ngram_stats(x, cond=conditioning, train=train, rng=sample_rng)
+    metrics_dict = model.apply(
+        variables, x, cond=conditioning, train=False, rngs=rngs
+    )
+
+  loss = metrics_dict["loss"]
+#   if train:
+#     return loss, (new_state, metrics_dict)
+#   return loss, metrics_dict
+
+  return loss, metrics_dict
+
+
 @jax.jit
 def merge_metrics(a_tree, b_tree):
   return jax.tree.map(lambda a, b: a + b, a_tree, b_tree)
@@ -388,9 +440,12 @@ def eval_step(
   rng = jax.random.fold_in(rng, jax.lax.axis_index("batch"))
   params = train_state.ema_params if ema_rate > 0.0 else train_state.params
 
-  _, metrics_dict = loss_fn(
-      params, train_state.state, rng, model, batch, train=False
-  )
+#   _, metrics_dict = loss_fn(
+#       params, train_state.state, rng, model, batch, train=False
+#   )
+  _, metrics_dict = loss_ngrams(
+    params, train_state.state, rng, model, batch, train=False
+    )
   
   return eval_metrics_class.gather_from_model_output(
       learning_rate=0.0, **metrics_dict
@@ -652,7 +707,7 @@ def train_and_evaluate(
 
 
 def evaluate_checkpoint(
-    config: ml_collections.ConfigDict, workdir: epath.PathLike
+    config: ml_collections.ConfigDict, workdir: epath.PathLike, checkpoint_step: int = -1, num_batches: int = 1
 ):
   """Runs an evaluation from a checkpoint.
 
@@ -714,10 +769,21 @@ def evaluate_checkpoint(
 
   # Retrieve data from previous checkpoints if possible.
   checkpointed_state = dict(train_state=train_state, train_iter=train_iter)
-  if checkpoint_manager.latest_step() is not None:
+#   if checkpoint_manager.latest_step() is not None:
+#     checkpointed_state = checkpoint_manager.restore(
+#         checkpoint_manager.latest_step(), items=checkpointed_state
+#     )
+  if checkpoint_step != -1:
+    checkpointed_state = checkpoint_manager.restore(
+        checkpoint_step, items=checkpointed_state
+    )
+  elif checkpoint_manager.latest_step() is not None:
     checkpointed_state = checkpoint_manager.restore(
         checkpoint_manager.latest_step(), items=checkpointed_state
     )
+  else:
+    raise ValueError("No checkpoint found")
+  
   train_state = checkpointed_state["train_state"]
   train_iter = checkpointed_state["train_iter"]
 
@@ -797,57 +863,74 @@ def evaluate_checkpoint(
     #     train_metrics = None
 
     #   if step == 1 or step % config.eval_every_steps == 0 or is_last_step:
-    #     for split, eval_loader in eval_loaders.items():
-    #       rng, eval_rng = jax.random.split(rng)
-    #       with report_progress.timed("eval"):
-    #         train_state = merge_batch_stats(train_state)
-    #         eval_metrics = evaluate(
-    #             p_eval_step,
-    #             eval_rng,
-    #             train_state,
-    #             eval_loader,
-    #             config.num_eval_steps,
-    #         )
-    #       eval_metrics_cpu = jax.tree_util.tree_map(
-    #           np.array, eval_metrics.compute()
-    #       )
-    #       eval_metrics_cpu = {
-    #           split + "_" + k: v for k, v in eval_metrics_cpu.items()
-    #       }
-    #       writer.write_scalars(step, eval_metrics_cpu)
+    for split, eval_loader in eval_loaders.items():
+        rng, eval_rng = jax.random.split(rng)
+        with report_progress.timed("eval"):
+            train_state = merge_batch_stats(train_state)
+            eval_metrics = evaluate(
+                p_eval_step,
+                eval_rng,
+                train_state,
+                eval_loader,
+                config.num_eval_steps,
+            )
+            eval_metrics_cpu = jax.tree_util.tree_map(
+                np.array, eval_metrics.compute()
+            )
+            eval_metrics_cpu = {
+                split + "_" + k: v for k, v in eval_metrics_cpu.items()
+            }
+            # writer.write_scalars(step, eval_metrics_cpu)
+            # print the python dict eval_metrics_cpu into a file
+    print(f"Eval_metrics_cpu: {eval_metrics_cpu}")
+    np.savez(f"evaluations/check_step{checkpoint_step}-eval_metrics_cpu.npz", **eval_metrics_cpu)
+    # with open(f"evaluations/check_step{checkpoint_step}-eval_metrics_cpu.pkl", "wb") as f:
+    #   pickle.dump(eval_metrics_cpu, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    #     if hasattr(model, "sample_step"):
-    #       with report_progress.timed("sample"):
-    #         _, sample_rng = jax.random.split(rng)
-    #         dummy_loader = train_loader
-    #         dummy_batch = utils.reshape_batch(next(iter(dummy_loader)))
-    #         dummy_inputs = dummy_batch[config.task_type]
-    #         if "label" in dummy_batch:
-    #           conditioning = dummy_batch["label"].astype("int32")
-    #         else:
-    #           conditioning = None
 
-    #         samples = sampling.generate(
-    #             model,
-    #             train_state,
-    #             flax_utils.replicate(sample_rng),
-    #             dummy_inputs,
-    #             conditioning=conditioning,
-    #         )
+    if hasattr(model, "sample_step"):
+        with report_progress.timed("sample"):
+            _, sample_rng = jax.random.split(rng)
+            dummy_loader = train_loader
 
-    #         all_samples = jax.pmap(
-    #             lambda x: jax.lax.all_gather(x, "batch"), axis_name="batch"
-    #         )(samples)
-    #         all_samples = flax_utils.unreplicate(all_samples)
-    #         all_samples = all_samples.reshape(-1, *data_shape)
-    #         if config.task_type == "image":
-    #           sample_grid = utils.generate_image_grids(all_samples)
-    #           writer.write_images(step, {"samples": sample_grid})
-    #           del all_samples, sample_grid
-    #         elif config.task_type == "text":
-    #           tokenizer = dataset_info["tokenizer"]
-    #           texts = utils.detokenize_texts(all_samples, tokenizer)
-    #           writer.write_texts(step, {"samples": texts})
+            for ib in range(num_batches):
+                _, sample_rng = jax.random.split(sample_rng)
+                dummy_batch = utils.reshape_batch(next(iter(dummy_loader)))
+                dummy_inputs = dummy_batch[config.task_type]
+                if "label" in dummy_batch:
+                    conditioning = dummy_batch["label"].astype("int32")
+                else:
+                    conditioning = None
+
+                samples = sampling.generate(
+                    model,
+                    train_state,
+                    flax_utils.replicate(sample_rng),
+                    dummy_inputs,
+                    conditioning=conditioning,
+                )
+
+                all_samples = jax.pmap(
+                    lambda x: jax.lax.all_gather(x, "batch"), axis_name="batch"
+                )(samples)
+                all_samples = flax_utils.unreplicate(all_samples)
+                all_samples = all_samples.reshape(-1, *data_shape)
+                if config.task_type == "image":
+                    raise NotImplementedError()
+                    # sample_grid = utils.generate_image_grids(all_samples)
+                    # writer.write_images(step, {"samples": sample_grid})
+                    # del all_samples, sample_grid
+                elif config.task_type == "text":
+                    tokenizer = dataset_info["tokenizer"]
+                    texts = utils.detokenize_texts(all_samples, tokenizer)
+                    texts_serializable = [text.tolist() if isinstance(text, np.ndarray) else text for text in texts]
+                    # writer.write_texts(step, {"samples": texts})
+                    # save in json file
+                    with open(f'evaluations/check_step{checkpoint_step}-samples_batch_{ib}.json', 'w') as f:
+                        json.dump(texts_serializable, f, indent=2)
+                    print(f"Samples_batch_{ib+1}/{num_batches} saved.")
+
+
 
     #   if step % config.checkpoint_every_steps == 0 or is_last_step:
     #     with report_progress.timed("checkpoint"):
@@ -862,4 +945,4 @@ def evaluate_checkpoint(
     #           ),
     #       )
 
-  logging.info("Finishing training at step %d", num_train_steps)
+  logging.info("Finishing evaluation of step %d", checkpoint_step)

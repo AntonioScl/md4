@@ -72,6 +72,70 @@ class MaskingSchedule(nn.Module):
 
   def dgamma_times_alpha(self, t):
     return self.dalpha(t) / (1.0 - self.alpha(t))
+  
+  def t_from_alpha(self, alpha_t):
+    adjusted_alpha_t = (alpha_t - self.eps) / (1.0 - 2 * self.eps)
+    if self.schedule_fn_type == 'linear':
+      return 1.0 - adjusted_alpha_t
+    elif 'poly' in self.schedule_fn_type:
+      exponent = float(self.schedule_fn_type.replace('poly', ''))
+      return (1.0 - adjusted_alpha_t) ** (1.0 / exponent)
+    elif self.schedule_fn_type == 'cosine':
+      return 1.0 - math.pi / (2.0 * jax.lax.acos(1.0 - adjusted_alpha_t))
+    else:
+      raise NotImplementedError()
+
+
+
+def noiseCall(t, schedule_fn_type):
+  # return logSNR
+  return jnp.log(noiseAlpha(t, schedule_fn_type) / (1.0 - noiseAlpha(t, schedule_fn_type)))
+
+def noise_dalpha(t, schedule_fn_type):
+  if schedule_fn_type == 'cosine':
+    return -math.pi / 2.0 * jax.lax.sin(math.pi / 2.0 * (1.0 - t))
+  elif schedule_fn_type == 'linear':
+    return -jnp.ones_like(t)
+  elif 'poly' in schedule_fn_type:
+    exponent = float(schedule_fn_type.replace('poly', ''))
+    return -exponent * t ** (exponent - 1.0)
+  else:
+    raise NotImplementedError()
+
+def noiseDalpha(t, schedule_fn_type):
+  eps = 1e-4
+  return (1.0 - 2 * eps) * noise_dalpha(t, schedule_fn_type)
+
+def noise_alpha(t, schedule_fn_type):
+  if schedule_fn_type == 'linear':
+    return 1.0 - t
+  elif 'poly' in schedule_fn_type:
+    exponent = float(schedule_fn_type.replace('poly', ''))
+    return 1.0 - t**exponent
+  elif schedule_fn_type == 'cosine':
+    return 1.0 - jax.lax.cos(math.pi / 2.0 * (1.0 - t))
+  else:
+    raise NotImplementedError()
+
+def noiseAlpha(t, schedule_fn_type):
+  eps = 1e-4
+  return (1.0 - 2 * eps) * noise_alpha(t, schedule_fn_type) + eps
+
+def noiseDgamma_times_alpha(t, schedule_fn_type):
+  return noiseDalpha(t, schedule_fn_type) / (1.0 - noiseAlpha(t, schedule_fn_type))
+
+def t_from_alpha(alpha_t, schedule_fn_type):
+  eps: float = 1e-4
+  adjusted_alpha_t = (alpha_t - eps) / (1.0 - 2 * eps)
+  if schedule_fn_type == 'linear':
+    return 1.0 - adjusted_alpha_t
+  elif 'poly' in schedule_fn_type:
+    exponent = float(schedule_fn_type.replace('poly', ''))
+    return (1.0 - adjusted_alpha_t) ** (1.0 / exponent)
+  elif schedule_fn_type == 'cosine':
+    return 1.0 - math.pi / (2.0 * jax.lax.acos(1.0 - adjusted_alpha_t))
+  else:
+    raise NotImplementedError()
 
 
 class MD4(nn.Module):
@@ -136,6 +200,26 @@ class MD4(nn.Module):
     un_mask = jax.random.bernoulli(self.make_rng('sample'), a, x.shape)
     # MASK = vocab_size
     return jnp.where(un_mask, x, self.vocab_size)
+
+  def forward_conditional_sample(self, x, t, x_tau, t_tau, rng):
+    t = utils.reverse_broadcast(t, x.ndim)
+    at = noiseAlpha(t, self.noise_schedule_type)
+    a_tau = noiseAlpha(t_tau, self.noise_schedule_type)
+    un_mask_proba = jnp.where(x_tau == self.vocab_size, (at - a_tau) / (1 - a_tau), 1.0)
+    un_mask = jax.random.bernoulli(rng, un_mask_proba, x.shape)
+    # MASK = vocab_size
+    return jnp.where(un_mask, x, self.vocab_size)
+  
+  def sample_masked_ngram(self, x, n, rng):
+    batch_size, seq_length = x.shape
+    mask_pos = jax.random.randint(rng, (batch_size,), 0, seq_length - n)
+    
+    def mask_single_sentence(sentence, pos):
+        mask = jnp.full((n,), self.vocab_size)
+        return jax.lax.dynamic_update_slice(sentence, mask, (pos,))
+    
+    x_masked = jax.vmap(mask_single_sentence)(x, mask_pos)
+    return x_masked
 
   def prior_sample(self, batch_size):
     return self.vocab_size * jnp.ones(
@@ -238,6 +322,88 @@ class MD4(nn.Module):
 
     # loss_diff: [bs]
     return loss_diff
+  
+
+  def diffusion_loss_ngram(self, n, x, cond=None, train=False, rng=None):
+    bs = x.shape[0]
+    # n is the number of adjacent tokens to mask. Compute the corresponding masking fraction
+    mask_fraction = n / self.data_shape[-1]
+    alpha_tau = 1-mask_fraction
+    # Compute the time such that 1-alpha(t) = mask_fraction
+    # tau = noise_schedule.t_from_alpha(alpha_tau)
+    tau = t_from_alpha(alpha_tau, schedule_fn_type=self.noise_schedule_type)
+
+    # rng1 = self.make_rng('sample')
+    rng, rng1 = jax.random.split(rng)
+    if self.antithetic_time_sampling:
+      t0 = jax.random.uniform(rng1) * tau
+      t = jnp.mod(t0 + jnp.arange(0.0, 1.0, step=1.0 / bs) * tau, 1.0)
+    else:
+      t = jax.random.uniform(rng1, shape=[bs]) * tau
+
+    if not self.cont_time:
+      # discretize time steps
+      t = (jnp.floor(t * self.timesteps) + 1) / self.timesteps
+
+    # Sample masked ngram x_tau
+    x_tau = self.sample_masked_ngram(x, n, rng)
+
+    # sample conditional trajectories z_t
+    zt = self.forward_conditional_sample(x, t, x_tau, tau, rng)
+    # zt = self.forward_sample(x, t)
+    logits, _ = self.predict_x(zt, t, cond=cond, train=train)
+    log_p = jax.nn.log_softmax(logits, axis=-1)
+    one_hot_x = jax.nn.one_hot(x, self.vocab_size)
+    neg_cross_ent = one_hot_x * log_p
+    neg_cross_ent = jnp.where(one_hot_x, neg_cross_ent, 0.0)
+    neg_cross_ent = jnp.sum(neg_cross_ent, axis=-1)
+    mask = (zt == self.vocab_size).astype('float32')
+
+    remaining_axis = list(range(x.ndim)[1:])
+    # masked_neg_cross_ent: [bs]
+    masked_neg_cross_ent = jnp.sum(mask * neg_cross_ent, remaining_axis)
+
+    if not self.cont_time:
+      # loss for finite depth T, i.e. discrete time
+      s = t - (1.0 / self.timesteps)
+      gt = noiseCall(t, self.noise_schedule_type)
+      gs = noiseCall(s, self.noise_schedule_type)
+      loss_diff = (
+          self.timesteps
+          * jnp.expm1(gt - gs)
+          * noiseAlpha(s, self.noise_schedule_type)
+          * masked_neg_cross_ent
+      )
+    else:
+      # cont-time loss
+      loss_diff = (
+          noiseDgamma_times_alpha(t, self.noise_schedule_type) * masked_neg_cross_ent
+      )
+
+    # loss_diff: [bs]
+    
+    # Average over the batch
+    loss_ngram = loss_diff.mean()
+    # # Fixed term
+    # loss_recon = self.recon_loss()
+    # #Total loss
+    # loss_ngram = loss_diff + loss_recon
+
+    return loss_ngram
+
+  # @nn.compact
+  def compute_ngram_stats(self, x, cond=None, train=False, rng=None):
+    # noise_schedule = MaskingSchedule(
+    #     self.data_shape, self.noise_schedule_type
+    # )
+    cond = self.get_cond_embedding(cond)
+    # max_logn = int(jnp.log2(x.shape[1]))
+    max_logn = 10
+
+    ngram_stats = {f'loss_ngram_{2**i}': self.diffusion_loss_ngram(2**i, x, cond=cond, train=train, rng=rng) for i in range(0, max_logn)}
+    # ngram_stats = utils.loss2bpt(ngram_stats, self.data_shape)
+
+    return ngram_stats
 
   @nn.compact
   def __call__(self, x, cond=None, train=False):
@@ -269,6 +435,13 @@ class MD4(nn.Module):
         'loss_prior': loss_prior,
         'loss_recon': loss_recon,
     }
+
+    if not train:
+      # 4. NGRAM STATISTICS: [bs]
+      rng2 = self.make_rng('sample')
+      ngram_stats = self.compute_ngram_stats(x, cond=cond, train=train, rng=rng2)
+      model_stats.update(ngram_stats)
+
     model_stats = utils.loss2bpt(model_stats, self.data_shape)
     return model_stats
 

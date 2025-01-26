@@ -30,3 +30,6 @@ slurm_out/*
 events*
 expt*
 run_evaluation.sh
+evaluations/*
+text_json
+check_step16-eval_metrics_cpu.pkl
